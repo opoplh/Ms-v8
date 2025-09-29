@@ -1,0 +1,512 @@
+import discord
+from discord.ext import commands
+import asyncio
+import subprocess
+import os
+import json
+from datetime import datetime
+import shlex
+
+# Bot setup
+intents = discord.Intents.default()
+intents.messages = True
+intents.message_content = True
+intents.members = True
+
+# Disable the default help command
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+
+# Admin role ID
+ADMIN_ROLE_ID = 1416253350592381035  # Replace with your actual admin role ID
+
+# Data storage
+try:
+    with open('user_data.json', 'r') as f:
+        user_data = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    user_data = {}
+
+try:
+    with open('vps_data.json', 'r') as f:
+        loaded_vps = json.load(f)
+    vps_data = {}
+    for uid, v in loaded_vps.items():
+        if isinstance(v, dict):
+            vps_data[uid] = [v]  # Convert old single dict to list
+        else:
+            vps_data[uid] = v  # Already a list
+except (FileNotFoundError, json.JSONDecodeError):
+    vps_data = {}
+
+# Save data function
+def save_data():
+    with open('user_data.json', 'w') as f:
+        json.dump(user_data, f, indent=4)
+    with open('vps_data.json', 'w') as f:
+        json.dump(vps_data, f, indent=4)
+
+# Check if user is admin
+def is_admin():
+    async def predicate(ctx):
+        admin_role = discord.utils.get(ctx.guild.roles, id=ADMIN_ROLE_ID)
+        if admin_role in ctx.author.roles:
+            return True
+        await ctx.send("You don't have permission to use this command.")
+        return False
+    return commands.check(predicate)
+
+# Bot events
+@bot.event
+async def on_ready():
+    print(f'{bot.user} has connected to Discord!')
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="!help for VPS services"))
+
+# Bot commands
+@bot.command(name='create')
+@is_admin()
+async def create_vps(ctx, user: discord.Member, ram: int, cpu: int):
+    """Create a custom VPS for a user (Admin only)"""
+    if ram <= 0 or cpu <= 0:
+        await ctx.send("RAM and CPU must be positive integers.")
+        return
+    user_id = str(user.id)
+    if user_id not in vps_data:
+        vps_data[user_id] = []
+    vps_count = len(vps_data[user_id]) + 1
+    container_name = f"vps-{user_id}-{vps_count}"
+    ram_mb = ram * 1024
+    try:
+        lxc_command = shlex.split(f"lxc launch ubuntu:22.04 {container_name} --config limits.memory={ram_mb}MB --config limits.cpu={cpu} -s btrpool")
+        subprocess.run(lxc_command, check=True)
+        vps_info = {
+            "container_name": container_name,
+            "ram": f"{ram}GB",
+            "cpu": str(cpu),
+            "storage": "10GB",
+            "status": "running",
+            "created_at": datetime.now().isoformat()
+        }
+        vps_data[user_id].append(vps_info)
+        save_data()
+        embed = discord.Embed(title="VPS Created Successfully", color=0x00ff00)
+        embed.add_field(name="User", value=user.mention, inline=True)
+        embed.add_field(name="VPS Number", value=str(vps_count), inline=True)
+        embed.add_field(name="Container", value=container_name, inline=True)
+        embed.add_field(name="RAM", value=f"{ram}GB", inline=True)
+        embed.add_field(name="CPU", value=str(cpu), inline=True)
+        embed.add_field(name="Storage", value="10GB", inline=True)
+        await ctx.send(embed=embed)
+    except subprocess.CalledProcessError as e:
+        await ctx.send(f"Error creating VPS: LXC command failed with error code {e.returncode}")
+    except Exception as e:
+        await ctx.send(f"Error creating VPS: {str(e)}")
+
+class ManageView(discord.ui.View):
+    def __init__(self, user_id, vps_list):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.vps_list = vps_list
+        self.selected_index = None
+
+        if len(vps_list) > 1:
+            options = [
+                discord.SelectOption(
+                    label=f"VPS {i+1} ({v.get('plan', 'Custom')})",
+                    value=str(i)
+                ) for i, v in enumerate(vps_list)
+            ]
+            self.select = discord.ui.Select(placeholder="Select a VPS to manage", options=options)
+            self.select.callback = self.select_vps
+            self.add_item(self.select)
+            self.initial_embed = discord.Embed(title="Select VPS to manage", color=0x0099ff)
+            self.initial_embed.add_field(name="Available VPS", value="\n".join([f"VPS {i+1}: {v['container_name']}" for i, v in enumerate(vps_list)]), inline=False)
+        else:
+            self.selected_index = 0
+            self.initial_embed = self.create_vps_embed(0)
+            self.add_action_buttons()
+
+    def create_vps_embed(self, index):
+        vps = self.vps_list[index]
+        embed = discord.Embed(title=f"VPS Management - VPS {index + 1}", color=0x0099ff)
+        embed.add_field(name="Plan" if 'plan' in vps else "Type", value=vps.get("plan", "Custom"), inline=True)
+        embed.add_field(name="Status", value=vps.get("status", "unknown"), inline=True)
+        embed.add_field(name="Container", value=vps["container_name"], inline=True)
+        embed.add_field(name="RAM", value=vps["ram"], inline=True)
+        embed.add_field(name="CPU", value=vps["cpu"], inline=True)
+        embed.add_field(name="Storage", value=vps["storage"], inline=True)
+        if "processor" in vps:
+            embed.add_field(name="Processor", value=vps["processor"], inline=True)
+        embed.add_field(name="Actions", value="Click the buttons below to manage your VPS:", inline=False)
+        return embed
+
+    def add_action_buttons(self):
+        start_button = discord.ui.Button(label="Start VPS", style=discord.ButtonStyle.green, emoji="🟢")
+        start_button.callback = lambda inter: self.action_callback(inter, 'start')
+        stop_button = discord.ui.Button(label="Stop VPS", style=discord.ButtonStyle.red, emoji="🔴")
+        stop_button.callback = lambda inter: self.action_callback(inter, 'stop')
+        tmate_button = discord.ui.Button(label="Tmate SSH", style=discord.ButtonStyle.blurple, emoji="🔗")
+        tmate_button.callback = lambda inter: self.action_callback(inter, 'tmate')
+        self.add_item(start_button)
+        self.add_item(stop_button)
+        self.add_item(tmate_button)
+
+    async def select_vps(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("This is not your VPS to manage!", ephemeral=True)
+            return
+        self.selected_index = int(self.select.values[0])
+        new_embed = self.create_vps_embed(self.selected_index)
+        self.clear_items()
+        self.add_action_buttons()
+        await interaction.response.edit_message(embed=new_embed, view=self)
+
+    async def action_callback(self, interaction: discord.Interaction, action: str):
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("This is not your VPS to manage!", ephemeral=True)
+            return
+        vps = self.vps_list[self.selected_index]
+        container_name = vps["container_name"]
+
+        if action == 'start':
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *shlex.split(f"lxc start {container_name}"),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await proc.wait()
+                if proc.returncode != 0:
+                    error = (await proc.stderr.read()).decode().strip()
+                    await interaction.response.send_message(f"Error starting VPS: {error}", ephemeral=True)
+                    return
+                vps["status"] = "running"
+                save_data()
+                await interaction.response.send_message("VPS started successfully.", ephemeral=True)
+            except Exception as e:
+                await interaction.response.send_message(f"Error starting VPS: {str(e)}", ephemeral=True)
+
+        elif action == 'stop':
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *shlex.split(f"lxc stop {container_name}"),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await proc.wait()
+                if proc.returncode != 0:
+                    error = (await proc.stderr.read()).decode().strip()
+                    await interaction.response.send_message(f"Error stopping VPS: {error}", ephemeral=True)
+                    return
+                vps["status"] = "stopped"
+                save_data()
+                await interaction.response.send_message("VPS stopped successfully.", ephemeral=True)
+            except Exception as e:
+                await interaction.response.send_message(f"Error stopping VPS: {str(e)}", ephemeral=True)
+
+        elif action == 'tmate':
+            await interaction.response.send_message("Tmate session request received. Please wait...", ephemeral=True)
+            # Check if tmate is installed
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "lxc", "exec", container_name, "--", "which", "tmate",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await proc.communicate()
+                if proc.returncode != 0:
+                    await interaction.followup.send("Tmate is not installed. Installing it now...", ephemeral=True)
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            "lxc", "exec", container_name, "--", "sudo", "apt-get", "update", "-y",
+                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                        )
+                        await proc.wait()
+                        proc = await asyncio.create_subprocess_exec(
+                            "lxc", "exec", container_name, "--", "sudo", "apt-get", "install", "tmate", "-y",
+                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                        )
+                        await proc.wait()
+                        if proc.returncode != 0:
+                            await interaction.followup.send("Failed to install tmate. Please check the container status.", ephemeral=True)
+                            return
+                        await interaction.followup.send("Tmate installed successfully. Now launching session...", ephemeral=True)
+                    except Exception as e:
+                        await interaction.followup.send(f"Failed to install tmate: {str(e)}", ephemeral=True)
+                        return
+            except Exception as e:
+                await interaction.followup.send(f"Error checking tmate installation: {str(e)}", ephemeral=True)
+                return
+
+            try:
+                # Start tmate session
+                proc = await asyncio.create_subprocess_exec(
+                    "lxc", "exec", container_name, "--", "tmate", "-S", "/tmp/tmate.sock", "new-session", "-d",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                await proc.wait()
+                await asyncio.sleep(2)
+
+                # Get SSH link
+                proc = await asyncio.create_subprocess_exec(
+                    "lxc", "exec", container_name, "--", "tmate", "-S", "/tmp/tmate.sock", "display", "-p", "#{tmate_ssh}",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await proc.communicate()
+                ssh_url = stdout.decode().strip() if stdout else None
+
+                if ssh_url:
+                    try:
+                        await interaction.user.send(f"Your Tmate SSH link for **{container_name}** is:\n`{ssh_url}`")
+                        await interaction.followup.send("Tmate SSH link sent to your DMs!", ephemeral=True)
+                    except discord.Forbidden:
+                        await interaction.followup.send("I couldn't send you a DM. Please enable DMs from server members.", ephemeral=True)
+                else:
+                    error_msg = stderr.decode().strip() if stderr else "Unknown error"
+                    await interaction.followup.send(f"Failed to get Tmate SSH link: {error_msg}", ephemeral=True)
+            except Exception as e:
+                await interaction.followup.send(f"Error starting tmate session: {str(e)}", ephemeral=True)
+
+@bot.command(name='manage')
+async def manage_vps(ctx):
+    """Manage your VPS"""
+    user_id = str(ctx.author.id)
+    vps_list = vps_data.get(user_id, [])
+    if not vps_list:
+        await ctx.send("You don't have a VPS. Use `!buywc` to purchase one.")
+        return
+    view = ManageView(user_id, vps_list)
+    await ctx.send(embed=view.initial_embed, view=view)
+
+@bot.command(name='buywc')
+async def buy_with_credits(ctx, plan: str, processor: str = "Intel"):
+    """Buy a VPS with credits"""
+    user_id = str(ctx.author.id)
+    prices = {
+        "Starter": {"Intel": 42, "AMD": 83},
+        "Basic": {"Intel": 96, "AMD": 164},
+        "Standard": {"Intel": 192, "AMD": 320},
+        "Pro": {"Intel": 220, "AMD": 340}
+    }
+    plans = {
+        "Starter": {"ram": "4GB", "cpu": "1", "storage": "10GB"},
+        "Basic": {"ram": "8GB", "cpu": "1", "storage": "10GB"},
+        "Standard": {"ram": "12GB", "cpu": "2", "storage": "10GB"},
+        "Pro": {"ram": "16GB", "cpu": "2", "storage": "10GB"}
+    }
+
+    if plan not in prices:
+        await ctx.send("Invalid plan. Available plans: Starter, Basic, Standard, Pro")
+        return
+    if processor not in ["Intel", "AMD"]:
+        await ctx.send("Please specify processor: `Intel` or `AMD`")
+        return
+
+    cost = prices[plan][processor]
+    if user_id not in user_data:
+        user_data[user_id] = {"credits": 0}
+
+    if user_data[user_id]["credits"] < cost:
+        await ctx.send(f"You don't have enough credits. You need {cost} but have {user_data[user_id]['credits']}.")
+        return
+
+    user_data[user_id]["credits"] -= cost
+    if user_id not in vps_data:
+        vps_data[user_id] = []
+    vps_count = len(vps_data[user_id]) + 1
+    container_name = f"vps-{user_id}-{vps_count}"
+    ram_str = plans[plan]["ram"]
+    cpu_str = plans[plan]["cpu"]
+    ram_mb = int(ram_str.replace("GB", "")) * 1024
+
+    try:
+        lxc_command = shlex.split(f"lxc launch ubuntu:22.04 {container_name} --config limits.memory={ram_mb}MB --config limits.cpu={cpu_str} -s btrpool")
+        subprocess.run(lxc_command, check=True)
+        vps_info = {
+            "plan": plan,
+            "container_name": container_name,
+            "ram": ram_str,
+            "cpu": cpu_str,
+            "storage": plans[plan]["storage"],
+            "status": "running",
+            "created_at": datetime.now().isoformat(),
+            "processor": processor
+        }
+        vps_data[user_id].append(vps_info)
+        save_data()
+        embed = discord.Embed(title="VPS Purchased Successfully", color=0x00ff00)
+        embed.add_field(name="Plan", value=plan, inline=True)
+        embed.add_field(name="VPS Number", value=str(vps_count), inline=True)
+        embed.add_field(name="Processor", value=processor, inline=True)
+        embed.add_field(name="Cost", value=f"{cost} credits", inline=True)
+        embed.add_field(name="Container", value=container_name, inline=True)
+        await ctx.send(embed=embed)
+    except subprocess.CalledProcessError as e:
+        await ctx.send(f"Error creating VPS: LXC command failed with error code {e.returncode}")
+    except Exception as e:
+        await ctx.send(f"Error creating VPS: {str(e)}")
+
+@bot.command(name='buyc')
+async def buy_credits(ctx):
+    """Get information on buying credits"""
+    user = ctx.author
+    payment_info = (
+        "**Payment Methods:**\n"
+        "• UPI: `9526303242@fam`\n"
+        "• PayPal: `example@paypal.com`\n"
+        "• Crypto: BTC, ETH, USDT\n\n"
+        "After payment, contact an admin with your transaction ID."
+    )
+    try:
+        await user.send(payment_info)
+        await ctx.send("Payment information sent to your DMs!")
+    except discord.Forbidden:
+        await ctx.send("I couldn't send you a DM. Please enable DMs from server members.")
+
+@bot.command(name='delete-vps')
+@is_admin()
+async def delete_vps(ctx, user: discord.Member, vps_number: int, *, reason: str = "No reason provided"):
+    """Delete a user's VPS (Admin only)"""
+    user_id = str(user.id)
+    if user_id not in vps_data or vps_number < 1 or vps_number > len(vps_data[user_id]):
+        await ctx.send("Invalid VPS number or user doesn't have a VPS.")
+        return
+    vps = vps_data[user_id][vps_number - 1]
+    container_name = vps["container_name"]
+    try:
+        lxc_command = shlex.split(f"lxc delete {container_name} --force")
+        subprocess.run(lxc_command, check=True)
+        del vps_data[user_id][vps_number - 1]
+        if not vps_data[user_id]:
+            del vps_data[user_id]
+        save_data()
+        embed = discord.Embed(title="VPS Deleted", color=0xff0000)
+        embed.add_field(name="User", value=user.mention, inline=True)
+        embed.add_field(name="VPS Number", value=str(vps_number), inline=True)
+        embed.add_field(name="Container", value=container_name, inline=True)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        await ctx.send(embed=embed)
+    except subprocess.CalledProcessError as e:
+        await ctx.send(f"Error deleting VPS: LXC command failed with error code {e.returncode}")
+    except Exception as e:
+        await ctx.send(f"Error deleting VPS: {str(e)}")
+
+@bot.command(name='plans')
+async def show_plans(ctx):
+    """Show available VPS plans"""
+    embed = discord.Embed(title="Hycroe Node V3 – VPS Plans", color=0x0099ff)
+    embed.add_field(
+        name="Starter",
+        value="RAM: 4 GB\nCPU: 1 Core\nStorage: 10 GB\nCredits: Intel : ₹42 / AMD : ₹83",
+        inline=False
+    )
+    embed.add_field(
+        name="Basic",
+        value="RAM: 8 GB\nCPU: 1 Core\nStorage: 10 GB\nCredits: Intel : ₹96 / AMD : ₹164",
+        inline=False
+    )
+    embed.add_field(
+        name="Standard",
+        value="RAM: 12 GB\nCPU: 2 Cores\nStorage: 10 GB\nCredits: Intel : ₹192 / AMD : ₹320",
+        inline=False
+    )
+    embed.add_field(
+        name="Pro",
+        value="RAM: 16 GB\nCPU: 2 Cores\nStorage: 10 GB\nCredits: Intel : ₹220 / AMD : ₹340",
+        inline=False
+    )
+    await ctx.send(embed=embed)
+
+@bot.command(name='adminc')
+@is_admin()
+async def admin_credits(ctx, user: discord.Member, amount: int):
+    """Add credits to a user's account (Admin only)"""
+    user_id = str(user.id)
+    if user_id not in user_data:
+        user_data[user_id] = {"credits": 0}
+    user_data[user_id]["credits"] += amount
+    save_data()
+    await ctx.send(f"Added {amount} credits to {user.mention}. New balance: {user_data[user_id]['credits']}")
+
+@bot.command(name='adminrc')
+@is_admin()
+async def admin_remove_credits(ctx, user: discord.Member, amount_or_all: str):
+    """Remove credits from a user (Admin only). Use 'all' to remove all credits."""
+    user_id = str(user.id)
+    if user_id not in user_data:
+        user_data[user_id] = {"credits": 0}
+    current_credits = user_data[user_id]["credits"]
+
+    if amount_or_all.lower() == "all":
+        removed = current_credits
+        user_data[user_id]["credits"] = 0
+        action = "All credits removed"
+    else:
+        try:
+            amount = int(amount_or_all)
+            if amount <= 0:
+                await ctx.send("Please provide a positive number or 'all'.")
+                return
+            if amount > current_credits:
+                amount = current_credits
+            user_data[user_id]["credits"] -= amount
+            removed = amount
+            action = f"{amount} credits removed"
+        except ValueError:
+            await ctx.send("Invalid amount. Please enter a number or 'all'.")
+            return
+
+    save_data()
+    await ctx.send(f"{action} from {user.mention}. Remaining balance: {user_data[user_id]['credits']} credits.")
+
+@bot.command(name='credits')
+async def show_credits(ctx):
+    """Show your credit balance"""
+    user_id = str(ctx.author.id)
+    if user_id not in user_data:
+        user_data[user_id] = {"credits": 0}
+        save_data()
+    await ctx.send(f"You have {user_data[user_id]['credits']} credits.")
+
+@bot.command(name='help')
+async def show_help(ctx):
+    """Show help information"""
+    embed = discord.Embed(title="VPS Bot Help", color=0x0099ff)
+    embed.add_field(
+        name="!plans",
+        value="Show available VPS plans and pricing",
+        inline=False
+    )
+    embed.add_field(
+        name="!buyc",
+        value="Get information on buying credits",
+        inline=False
+    )
+    embed.add_field(
+        name="!buywc <plan> <Intel/AMD>",
+        value="Buy a VPS using your credits",
+        inline=False
+    )
+    embed.add_field(
+        name="!credits",
+        value="Check your credit balance",
+        inline=False
+    )
+    embed.add_field(
+        name="!manage",
+        value="Manage your VPS (start, stop, tmate)",
+        inline=False
+    )
+    if any(role.id == ADMIN_ROLE_ID for role in ctx.author.roles):
+        embed.add_field(
+            name="Admin Commands",
+            value="`!create @user <ram> <cpu>` - Create custom VPS for user\n"
+                  "`!delete-vps @user <vps_number> <reason>` - Delete user's VPS\n"
+                  "`!adminc @user <amount>` - Add credits to user\n"
+                  "`!adminrc @user <amount/all>` - Remove credits from user",
+            inline=False
+        )
+    await ctx.send(embed=embed)
+
+# Run the bot
+if __name__ == "__main__":
+    bot.run('Token')
