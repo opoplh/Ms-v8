@@ -17,7 +17,7 @@ intents.members = True
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
 # Admin role ID
-ADMIN_ROLE_ID = 1416253350592381035  # Replace with your actual admin role ID
+ADMIN_ROLE_ID = 1295737579840340032 # Replace with your actual admin role ID
 
 # Data storage
 try:
@@ -509,4 +509,4 @@ async def show_help(ctx):
 
 # Run the bot
 if __name__ == "__main__":
-    bot.run('Token')
+    bot.run('MTQxNTcwNzU5NDA4OTMwNDA4NA.Gwnq_4.3Vgvn_75wEIsgnM49FFZfKF3ioj6eb2t_ET_6A')
